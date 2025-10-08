@@ -1,375 +1,528 @@
 """
-audio2face_robot.py
-====================
+Robot Assistant — Desktop (Python) with END‑OF‑SPEECH detection
+- Realtime microphone stream with VAD (voice activity detection)
+- Detects when the speaker STOPS talking (endpointing) and then triggers
+  transcription + emotion classification for the whole utterance
+- Animates a face in a PyGame window to reflect emotion
 
-This script demonstrates how to build a voice‑driven animated face using
-NVIDIA's open‑source Audio2Face‑3D microservice together with basic
-voice activity detection (VAD), speech‑to‑text (STT) via OpenAI, and a
-simple 2D parametric face renderer.  The resulting pipeline is intended
-to be used as a reference by an agent tasked with assembling a more
-complete assistant robot.  It shows how to:
+Setup
+-----
+1) Python 3.10+
+2) pip install -r requirements.txt   (see inline list below)
+3) Set your key:  export OPENAI_API_KEY=sk-...
+4) Run:  python main.py
 
-  * Capture audio from a microphone in short frames using `sounddevice`.
-  * Detect the end of a user's utterance with `webrtcvad` and a silence
-    threshold.
-  * Optionally transcribe the utterance with OpenAI's whisper models.
-  * Send the raw audio to the Audio2Face‑3D microservice and receive
-    blendshape weights and an inferred emotion.
-  * Map the inferred emotion to a set of simple pose parameters (brows,
-    mouth, eyes, head tilt) and animate a face drawn with `pygame`.
+Requirements
+------------
+pygame
+sounddevice
+soundfile
+numpy
+webrtcvad
+openai
 
-This script is not a complete production system.  It relies on an
-Audio2Face‑3D microservice running locally (see the README in the
-Audio2Face‑3D repository for instructions on starting the service) and
-requires a valid OpenAI API key if transcription is desired.  Use it as
-a starting point for your own integration.
-
-Dependencies:
-  pip install sounddevice soundfile numpy webrtcvad requests pygame openai
-
-Environment variables:
-  OPENAI_API_KEY – your OpenAI API key (if transcription is enabled).
-  AUDIO2FACE_SERVER_URL – base URL for the Audio2Face microservice
-    (default: http://localhost:5000/infer).
-
-Note:
-  Running Audio2Face inference requires a supported NVIDIA GPU and the
-  pre‑trained models from the Audio2Face‑3D repository.  The
-  microservice can be run inside a Docker container provided by
-  NVIDIA.
-
+Notes
+-----
+- VAD uses WebRTC (webrtcvad) at 20ms frames; it buffers audio until
+  there is sustained silence (e.g., 800 ms) after speech → utterance end.
+- You can tune thresholds under VADConfig.
+- Swap SimpleFace with your robot’s renderer when ready.
 """
 
 import io
 import os
+import time
+import json
 import queue
 import threading
-import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from collections import deque
 
 import numpy as np
-import requests
 import sounddevice as sd
+import soundfile as sf
+import pygame
+from pygame import gfxdraw
 import webrtcvad
+from dotenv import load_dotenv
 
-try:
-    import pygame
-except ImportError:
-    pygame = None  # Optional; the renderer is disabled if pygame isn't available.
+from openai import OpenAI
 
-try:
-    import openai
-except ImportError:
-    openai = None  # STT is optional.
+# --------------- Config -----------------
+load_dotenv()
 
-# -----------------------------------------------------------------------------
-# Voice Activity Detection and Audio Capture
-# -----------------------------------------------------------------------------
+SAMPLE_RATE = 16000          # VAD requires 8/16/32/48k; we use 16k
+CHANNELS = 1
+FRAME_MS = 20                # 10, 20, or 30ms only
+SILENCE_TAIL_MS = 800        # how much trailing silence = end of utterance
+PRE_ROLL_MS = 200            # audio kept before first speech
+VAD_AGGRESSIVENESS = 2       # 0-3 (3 most aggressive)
+EMOTION_HYSTERESIS_FRAMES = 2  # Utterances to see emotion before change
 
-class AudioStream:
-    """Continuously records audio from the default microphone in small frames.
+STT_MODEL = os.getenv("STT_MODEL", "whisper-1")
+CLS_MODEL = os.getenv("CLS_MODEL", "gpt-4-turbo")
+LABELS = ["listening","happy","laughing","sad","angry","surprised","confused"]
 
-    Each frame is 20 ms long (160 samples at 8 kHz) which is the required
-    granularity for WebRTC VAD.  The frames are pushed into a thread‑safe
-    queue for processing by the main loop.  The stream runs in a background
-    thread and stops when `stop()` is called.
+# --------------- OpenAI client ----------
+client = OpenAI()
+
+# --------------- Helpers ----------------
+def float32_to_int16(audio_f32: np.ndarray) -> bytes:
+    # Expect shape (n, 1) float32 in [-1,1]
+    a = np.clip(audio_f32.squeeze(), -1.0, 1.0)
+    a_i16 = (a * 32767.0).astype(np.int16)
+    return a_i16.tobytes()
+
+@dataclass
+class Utterance:
+    pcm_bytes: bytes  # 16-bit mono PCM
+    wav_bytes: bytes  # WAV container for STT
+    start_ts: float
+    end_ts: float
+
+# --------------- VAD Stream -------------
+class VADConfig:
+    samplerate = SAMPLE_RATE
+    frame_ms = FRAME_MS
+    aggressiveness = VAD_AGGRESSIVENESS
+    pre_roll_ms = PRE_ROLL_MS
+    silence_tail_ms = SILENCE_TAIL_MS
+
+class VADStream:
+    """Turn continuous mic audio into utterances using WebRTC VAD.
+    Emits an Utterance when speech ends (detected by trailing silence).
     """
-
-    def __init__(self, sample_rate: int = 16000, frame_duration_ms: int = 20):
-        self.sample_rate = sample_rate
-        self.frame_duration_ms = frame_duration_ms
-        self.frame_samples = int(sample_rate * frame_duration_ms / 1000)
-        self._queue: "queue.Queue[np.ndarray]" = queue.Queue()
-        self._stream = None
+    def __init__(self, cfg: VADConfig):
+        self.cfg = cfg
+        self.frame_size = int(cfg.samplerate * cfg.frame_ms / 1000)
+        self.bytes_per_frame = self.frame_size * 2  # int16 mono
+        self.vad = webrtcvad.Vad(cfg.aggressiveness)
+        self.q_frames = queue.Queue()  # raw PCM16 frames in bytes
+        self.q_utts = queue.Queue()    # Utterance objects
         self._running = False
+        self._stream = None
+        self._th = None
 
-    def start(self) -> None:
-        if self._running:
-            return
+        # state
+        self.preroll = deque(maxlen=int(cfg.pre_roll_ms / cfg.frame_ms))
+        self.active_buf = bytearray()
+        self.in_speech = False
+        self.last_voice_ts = 0.0
+        self.latest_rms = 0.0
+
+    def _audio_cb(self, indata, frames, time_info, status):
+        # indata float32; convert to int16 PCM expected by VAD
+        self.latest_rms = np.sqrt(np.mean(np.square(indata)))
+        pcm = float32_to_int16(indata)
+        # break into exact FRAME_MS chunks
+        for off in range(0, len(pcm), self.bytes_per_frame):
+            chunk = pcm[off:off+self.bytes_per_frame]
+            if len(chunk) == self.bytes_per_frame:
+                self.q_frames.put(chunk)
+
+    def start(self):
+        if self._running: return
         self._running = True
-        self._stream = sd.RawInputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.frame_samples,
-            channels=1,
-            dtype="int16",
-            callback=self._callback,
+        self._stream = sd.InputStream(
+            channels=CHANNELS,
+            samplerate=self.cfg.samplerate,
+            blocksize=self.frame_size,  # pulls about FRAME_MS frames
+            dtype='float32',
+            callback=self._audio_cb
         )
         self._stream.start()
-        threading.Thread(target=self._run, daemon=True).start()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
 
-    def _callback(self, indata, frames, time_info, status) -> None:
-        if not self._running:
-            return
-        # Copy to avoid referencing memory after callback returns
-        self._queue.put(bytes(indata))
-
-    def _run(self) -> None:
-        # Keep the thread alive until stopped
-        while self._running:
-            time.sleep(0.1)
-
-    def read_frame(self) -> bytes:
-        """Blocking read of the next audio frame."""
-        return self._queue.get()
-
-    def stop(self) -> None:
+    def stop(self):
         self._running = False
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+        if self._stream:
+            self._stream.stop(); self._stream.close()
+        if self._th:
+            self._th.join(timeout=1.0)
 
-# -----------------------------------------------------------------------------
-# Parametric Face Renderer
-# -----------------------------------------------------------------------------
+    def _emit_utterance(self, end_ts: float):
+        if not self.active_buf and not self.preroll:
+            return
+        self.in_speech = False
+        pcm_bytes = b''.join(self.preroll) + bytes(self.active_buf)
+        # pack as WAV for STT
+        bio = io.BytesIO()
+        # convert back to np.int16 for soundfile
+        pcm_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.int16)
+        sf.write(bio, pcm_np, self.cfg.samplerate, format='WAV', subtype='PCM_16')
+        wav_bytes = bio.getvalue()
+        start_ts = end_ts - (len(pcm_bytes) / 2) / self.cfg.samplerate
+        utt = Utterance(pcm_bytes=pcm_bytes, wav_bytes=wav_bytes, start_ts=start_ts, end_ts=end_ts)
+        self.q_utts.put(utt)
+        # reset
+        self.active_buf.clear()
+        self.preroll.clear()
 
+
+    def _process_frame(self):
+        """Processes a single frame of audio from the queue."""
+        try:
+            frame = self.q_frames.get(timeout=0.01)
+            now = time.time()
+            is_voiced = False
+            try:
+                is_voiced = self.vad.is_speech(frame, self.cfg.samplerate)
+            except Exception:
+                is_voiced = False
+
+            if is_voiced:
+                self.last_voice_ts = now
+                if not self.in_speech:
+                    self.in_speech = True
+                    self.active_buf.extend(b''.join(self.preroll))
+                    self.preroll.clear()
+                self.active_buf.extend(frame)
+            else:
+                if self.in_speech:
+                    self.active_buf.extend(frame)
+                    if (now - self.last_voice_ts) >= self.cfg.silence_tail_ms / 1000.0:
+                        self._emit_utterance(now)
+                else:
+                    self.preroll.append(frame)
+
+        except queue.Empty:
+            if self.in_speech and (time.time() - self.last_voice_ts) >= self.cfg.silence_tail_ms / 1000.0:
+                self._emit_utterance(time.time())
+            return
+
+    def _loop(self):
+        while self._running:
+            self._process_frame()
+
+# --------------- NLP worker -------------
+class NLPWorker:
+    def __init__(self, hysteresis_threshold=2):
+        self.label = "listening"
+        self.confidence = 0.0
+        self._running = False
+        self._th = None
+        self._in_q = queue.Queue()
+
+        # Hysteresis state
+        self.hysteresis_threshold = hysteresis_threshold
+        self.candidate_label = "listening"
+        self.candidate_confidence = 0.0
+        self.candidate_count = 0
+
+    def push_utterance(self, utt: Utterance):
+        self._in_q.put(utt)
+
+    def start(self):
+        if self._running: return
+        self._running = True
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def stop(self):
+        self._running = False
+        if self._th:
+            self._th.join(timeout=1.0)
+
+    def _transcribe(self, wav_bytes: bytes) -> str:
+        file_like = io.BytesIO(wav_bytes)
+        file_like.name = "utt.wav"
+        try:
+            t = client.audio.transcriptions.create(
+                file=file_like,
+                model=STT_MODEL,
+                language='en'
+            )
+            return getattr(t, 'text', '') or ''
+        except Exception as e:
+            try:
+                t = client.audio.transcriptions.create(
+                    file=file_like,
+                    model='whisper-1',
+                    language='en'
+                )
+                return getattr(t, 'text', '') or ''
+            except Exception:
+                print('Transcription error:', e)
+                return ''
+
+    def _classify(self, text: str):
+        try:
+            system = (
+                "You output ONLY strict JSON: {\"label\": string, \"confidence\": number}. "
+                f"Choose label from this set: {', '.join(LABELS)}. "
+                "If neutral/no emotion, use 'listening'."
+            )
+            resp = client.chat.completions.create(
+                model=CLS_MODEL,
+                temperature=0,
+                messages=[
+                    {"role":"system","content":system},
+                    {"role":"user","content":f"""Text: {text}
+Respond with JSON only."""}
+                ]
+            )
+            data = json.loads(resp.choices[0].message.content)
+            label = data.get('label', 'listening')
+            conf = float(data.get('confidence', 0.5))
+            if label not in LABELS:
+                label = 'listening'
+            return label, conf
+        except Exception as e:
+            print('Classification error:', e)
+            return 'listening', 0.0
+
+    def _process_utterance(self):
+        """Processes a single utterance from the queue."""
+        try:
+            utt = self._in_q.get(timeout=0.01)
+        except queue.Empty:
+            return
+
+        text = self._transcribe(utt.wav_bytes)
+        if not text:
+            if self.label != "listening":
+                print("No text from STT, returning to listening state.")
+            self.label, self.confidence = "listening", 0.0
+            self.candidate_label, self.candidate_count = "listening", 0
+            return
+
+        new_label, new_conf = self._classify(text)
+
+        if new_label == self.candidate_label:
+            self.candidate_count += 1
+        else:
+            self.candidate_label = new_label
+            self.candidate_confidence = new_conf
+            self.candidate_count = 1
+
+        if self.candidate_count >= self.hysteresis_threshold:
+            if self.label != self.candidate_label:
+                print(f"Emotion state changed to: {self.candidate_label}")
+            self.label = self.candidate_label
+            self.confidence = self.candidate_confidence
+
+    def _loop(self):
+        while self._running:
+            self._process_utterance()
+
+# --------------- Face UI (PyGame) -------
 @dataclass
 class FacePose:
     """Represents a set of facial pose parameters for a simple 2D face."""
-
     brow_l: float = 0.0
     brow_r: float = 0.0
     mouth_curve: float = 0.0
     mouth_open: float = 0.0
     eye_open: float = 1.0
+    pupil_x: float = 0.0
+    pupil_y: float = 0.0
     head_tilt: float = 0.0
-
 
 class FaceRenderer:
     """Draws a simple face using pygame given the current pose."""
 
     def __init__(self, width: int = 640, height: int = 480):
-        if pygame is None:
-            raise RuntimeError(
-                "pygame is not installed; install it or set up an alternative renderer"
-            )
         pygame.init()
+        pygame.display.set_caption("Robot Face")
         self.width = width
         self.height = height
         self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("Audio2Face Robot")
         self.clock = pygame.time.Clock()
+        self.bg_color = (10, 16, 40)
+        self.face_color = (240, 220, 210)
+        self.stroke_color = (20, 20, 20)
+        self.hud_emotion = "listening"
 
-    def draw_face(self, pose: FacePose) -> None:
-        # Background
-        self.screen.fill((30, 30, 30))
+    def draw_face(self, pose: FacePose, status: str) -> None:
+        self.screen.fill(self.bg_color)
         cx, cy = self.width // 2, self.height // 2
         face_radius = min(self.width, self.height) * 0.35
-        # Apply head tilt by rotating the coordinate system
-        tilt_deg = pose.head_tilt * 57.2958  # radians to degrees
-        surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        # Draw head
-        pygame.draw.circle(surface, (240, 220, 210), (cx, cy), int(face_radius))
-        # Mouth
-        mouth_y = cy + int(face_radius * 0.4)
-        mouth_width = face_radius * 0.8
-        mouth_height = pose.mouth_open * 30 + 5
-        curve = pose.mouth_curve
-        start_angle = np.pi + curve * np.pi / 4
-        end_angle = 2 * np.pi - curve * np.pi / 4
-        rect = pygame.Rect(
-            cx - mouth_width / 2, mouth_y - mouth_height / 2, mouth_width, mouth_height
-        )
-        pygame.draw.arc(surface, (50, 10, 10), rect, start_angle, end_angle, 4)
-        # Eyes
+
+        face_surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        pygame.draw.circle(face_surface, self.face_color, (cx, cy), int(face_radius))
+
         eye_offset_x = face_radius * 0.35
         eye_offset_y = face_radius * 0.15
-        eye_width = face_radius * 0.25
-        eye_height = face_radius * 0.15 * pose.eye_open
+        eye_width = face_radius * 0.3
+        eye_height = face_radius * 0.3 * pose.eye_open
         for sign in [-1, 1]:
             ex = cx + sign * eye_offset_x
             ey = cy - eye_offset_y
-            pygame.draw.ellipse(
-                surface,
-                (20, 20, 20),
-                (ex - eye_width / 2, ey - eye_height / 2, eye_width, eye_height),
-            )
-            # Brows
-            brow_y = ey - eye_height * 1.2
-            brow_width = eye_width
-            brow_height = face_radius * 0.03
+            pygame.draw.ellipse(face_surface, (255, 255, 255), (ex - eye_width / 2, ey - eye_height / 2, eye_width, eye_height))
+            pygame.draw.ellipse(face_surface, self.stroke_color, (ex - eye_width / 2, ey - eye_height / 2, eye_width, eye_height), 2)
+            pupil_radius = eye_width * 0.2
+            px = ex + pose.pupil_x * (eye_width / 2 - pupil_radius)
+            py = ey + pose.pupil_y * (eye_height / 2 - pupil_radius)
+            pygame.draw.circle(face_surface, self.stroke_color, (int(px), int(py)), int(pupil_radius))
+
+            brow_y = ey - eye_height * 1.5
+            brow_width = eye_width * 1.2
+            brow_height = face_radius * 0.05
             brow_curve = pose.brow_l if sign == -1 else pose.brow_r
-            brow_rect = pygame.Rect(
-                ex - brow_width / 2, brow_y - brow_height / 2, brow_width, brow_height
-            )
-            # Tilt brow by adjusting start/end angles
-            brow_start = np.pi * (1.1 + brow_curve * 0.2)
-            brow_end = np.pi * (1.4 + brow_curve * 0.2)
-            pygame.draw.arc(surface, (0, 0, 0), brow_rect, brow_start, brow_end, 3)
-        # Rotate the surface for head tilt
-        rotated = pygame.transform.rotate(surface, tilt_deg)
-        rect = rotated.get_rect(center=(cx, cy))
-        self.screen.blit(rotated, rect)
+            brow_rect = pygame.Rect(ex - brow_width / 2, brow_y - brow_height, brow_width, brow_height * 2)
+            start_angle = np.pi + (np.pi/4 * brow_curve * sign)
+            end_angle = 2*np.pi - (np.pi/4 * brow_curve * sign)
+            pygame.draw.arc(face_surface, self.stroke_color, brow_rect, start_angle, end_angle, 5)
+
+        mouth_y = cy + int(face_radius * 0.4)
+        mouth_width = face_radius * 0.8
+        mouth_height = pose.mouth_open * 40 + 5
+        curve = pose.mouth_curve
+        if mouth_height > 5:
+            mouth_rect = pygame.Rect(cx - mouth_width/2, mouth_y - mouth_height/2, mouth_width, mouth_height)
+            pygame.draw.ellipse(face_surface, self.stroke_color, mouth_rect)
+        else:
+            start_angle = np.pi + curve * np.pi / 2.5
+            end_angle = 2 * np.pi - curve * np.pi / 2.5
+            mouth_rect = pygame.Rect(cx - mouth_width / 2, mouth_y - 20, mouth_width, 40)
+            pygame.draw.arc(face_surface, self.stroke_color, mouth_rect, start_angle, end_angle, 4)
+
+        tilt_deg = pose.head_tilt * -30
+        rotated_surface = pygame.transform.rotate(face_surface, tilt_deg)
+        rotated_rect = rotated_surface.get_rect(center=(cx, cy))
+        self.screen.blit(rotated_surface, rotated_rect.topleft)
+
+        font = pygame.font.SysFont(None, 22)
+        hud_emotion = font.render(f"emotion: {self.hud_emotion}", True, (180,200,255))
+        hud_status = font.render(f"status: {status}", True, (150,170,220))
+        self.screen.blit(hud_emotion, (16, 16))
+        self.screen.blit(hud_status, (16, 40))
+
         pygame.display.flip()
-        self.clock.tick(30)
 
-# -----------------------------------------------------------------------------
-# Utility functions
-# -----------------------------------------------------------------------------
-
-def transcribe_audio(audio_data: bytes, sample_rate: int = 16000) -> str:
-    """Transcribes an utterance using OpenAI whisper if available.
-
-    Returns an empty string if OpenAI is not configured.
-    """
-    if openai is None or not os.getenv("OPENAI_API_KEY"):
-        return ""
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    try:
-        import soundfile as sf
-
-        # Write to in‑memory buffer as WAV
-        with io.BytesIO() as buf:
-            # Convert int16 bytes to float32 for whisper
-            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            sf.write(buf, audio_np, sample_rate, format="WAV")
-            buf.seek(0)
-            response = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=buf,
-                response_format="json",
-            )
-        return response.get("text", "")
-    except Exception as e:
-        print("STT error:", e)
-        return ""
-
-
-def send_to_audio2face(audio_data: bytes, sample_rate: int = 16000) -> Dict:
-    """Send audio to the Audio2Face microservice and return the JSON result.
-
-    The microservice must accept multipart/form‑data with an 'audio' file.
-    See the Audio2Face‑3D microservice sample for the expected API.
-    """
-    server_url = os.getenv("AUDIO2FACE_SERVER_URL", "http://localhost:8000/infer")
-    try:
-        files = {
-            "audio": ("utterance.wav", audio_data, "application/octet-stream"),
-            "sample_rate": (None, str(sample_rate)),
-        }
-        resp = requests.post(server_url, files=files, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print("Audio2Face request error:", e)
-        return {}
+    def loop(self, state_getter):
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+            pose, status, emotion = state_getter()
+            self.hud_emotion = emotion
+            self.draw_face(pose, status)
+            self.clock.tick(60)
+        pygame.quit()
 
 
 def map_emotion_to_pose(emotion: str) -> FacePose:
-    """Map the Audio2Face emotion label to a FacePose.
-
-    The Audio2Face microservice may return emotions like 'neutral', 'happy',
-    'sad', 'angry', 'surprised', etc.  Adjust these values to taste.
-    """
-    # Base neutral pose
-    pose = FacePose()
+    """Map the emotion label to a target FacePose."""
+    pose = FacePose() # Start with neutral
     if emotion == "happy":
         pose.mouth_curve = 0.8
         pose.mouth_open = 0.3
-        pose.brow_l = pose.brow_r = -0.2
-        pose.eye_open = 0.95
-        pose.head_tilt = 0.05
+        pose.brow_l = pose.brow_r = -0.3
     elif emotion == "sad":
         pose.mouth_curve = -0.6
-        pose.mouth_open = 0.2
-        pose.brow_l = 0.4
-        pose.brow_r = 0.4
-        pose.eye_open = 0.9
-        pose.head_tilt = -0.05
+        pose.brow_l = 0.3
+        pose.brow_r = -0.3
+        pose.eye_open = 0.8
     elif emotion == "angry":
-        pose.mouth_curve = -0.3
-        pose.mouth_open = 0.2
+        pose.mouth_curve = -0.4
         pose.brow_l = 0.6
         pose.brow_r = 0.6
-        pose.eye_open = 0.9
-        pose.head_tilt = -0.02
+        pose.head_tilt = -0.1
     elif emotion == "surprised":
-        pose.mouth_curve = 0.2
-        pose.mouth_open = 0.6
-        pose.brow_l = -0.5
-        pose.brow_r = -0.5
+        pose.mouth_open = 0.7
+        pose.brow_l = -0.7
+        pose.brow_r = -0.7
         pose.eye_open = 1.0
-        pose.head_tilt = 0.0
-    elif emotion == "neutral":
-        pose.mouth_curve = 0.0
-        pose.mouth_open = 0.1
-        pose.brow_l = pose.brow_r = 0.0
-        pose.eye_open = 0.95
-        pose.head_tilt = 0.0
-    # Add other mappings as necessary
+    elif emotion == "laughing":
+        pose.mouth_curve = 0.5
+        pose.mouth_open = 0.8
+    elif emotion == "confused":
+        pose.brow_r = 0.4
+        pose.mouth_curve = -0.1
+        pose.head_tilt = 0.1
     return pose
 
 
-def main() -> None:
-    # Initialize audio stream and VAD
-    vad = webrtcvad.Vad(2)  # Aggressiveness (0–3). 2 is a good default.
-    stream = AudioStream(sample_rate=16000, frame_duration_ms=20)
-    stream.start()
-    audio_frames: list[bytes] = []
-    speech_started = False
-    silence_ms = 0
-    silence_threshold_ms = 800  # end of speech if this much silence accumulated
+# --------------- App wiring -------------
+class App:
+    def __init__(self):
+        self.vad = VADStream(VADConfig())
+        self.nlp = NLPWorker(hysteresis_threshold=EMOTION_HYSTERESIS_FRAMES)
+        self.face = FaceRenderer(width=640, height=480)
+        self.status = "listening"
+        self.current_pose = FacePose()
+        self.target_pose = FacePose()
+        self.last_blink_time = time.time()
+        self.next_blink_delay = np.random.uniform(2.0, 5.0)
+        self.is_blinking = False
+        self.blink_end_time = 0.0
+        self.last_emotion_label = "listening"
 
-    # Initialize renderer if available
-    renderer = None
-    pose = FacePose()
-    if pygame is not None:
-        renderer = FaceRenderer()
+    def start(self):
+        print("Starting VAD & NLP…")
+        self.vad.start()
+        self.nlp.start()
+        threading.Thread(target=self._pump, daemon=True).start()
+        self.face.loop(self._get_state)
+        self.shutdown()
 
-    try:
+    def _pump(self):
         while True:
-            frame = stream.read_frame()
-            is_speech = vad.is_speech(frame, sample_rate=16000)
-            if is_speech:
-                audio_frames.append(frame)
-                speech_started = True
-                silence_ms = 0
-            elif speech_started:
-                silence_ms += 20
-                if silence_ms >= silence_threshold_ms:
-                    # End of utterance
-                    utterance_data = b"".join(audio_frames)
-                    audio_frames = []
-                    speech_started = False
-                    silence_ms = 0
-                    # Process utterance in a worker thread to avoid blocking audio
-                    threading.Thread(
-                        target=process_utterance, args=(utterance_data, pose, renderer)
-                    ).start()
-            # Draw current pose
-            if renderer is not None:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        raise KeyboardInterrupt
-                renderer.draw_face(pose)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stream.stop()
-        if pygame is not None:
-            pygame.quit()
+            try:
+                utt = self.vad.q_utts.get(timeout=0.01)
+                self.nlp.push_utterance(utt)
+            except queue.Empty:
+                continue
 
+    def _get_state(self):
+        now = time.time()
+        dt = self.face.clock.get_time() / 1000.0
 
-def process_utterance(audio_data: bytes, pose: FacePose, renderer: FaceRenderer | None) -> None:
-    """Handle a completed utterance: transcribe, query Audio2Face, update pose."""
-    # Optionally transcribe speech (useful for logging)
-    transcript = transcribe_audio(audio_data)
-    if transcript:
-        print("You said:", transcript)
-    # Send to Audio2Face microservice
-    result = send_to_audio2face(audio_data)
-    emotion = result.get("emotion", "neutral")
-    print("Detected emotion:", emotion)
-    # Map emotion to pose
-    new_pose = map_emotion_to_pose(emotion)
-    # Update pose values atomically
-    pose.brow_l = new_pose.brow_l
-    pose.brow_r = new_pose.brow_r
-    pose.mouth_curve = new_pose.mouth_curve
-    pose.mouth_open = new_pose.mouth_open
-    pose.eye_open = new_pose.eye_open
-    pose.head_tilt = new_pose.head_tilt
+        if self.vad.in_speech:
+            self.status = "speaking"
+        elif self.status == "speaking":
+            self.status = "processing"
+
+        if self.nlp.label != self.last_emotion_label:
+            if self.status == "processing":
+                self.status = "listening"
+            self.last_emotion_label = self.nlp.label
+            self.target_pose = map_emotion_to_pose(self.nlp.label)
+
+        tween_speed = 4.0
+        for field in self.current_pose.__dataclass_fields__:
+            current_val = getattr(self.current_pose, field)
+            target_val = getattr(self.target_pose, field)
+            new_val = current_val + (target_val - current_val) * min(dt * tween_speed, 1.0)
+            setattr(self.current_pose, field, new_val)
+
+        final_pose = FacePose(**self.current_pose.__dict__)
+
+        blink_duration = 0.12
+        if self.is_blinking and now > self.blink_end_time:
+            self.is_blinking = False
+            self.last_blink_time = now
+            self.next_blink_delay = np.random.uniform(2.5, 5.5)
+
+        if not self.is_blinking and now > self.last_blink_time + self.next_blink_delay:
+            self.is_blinking = True
+            self.blink_end_time = now + blink_duration
+
+        if self.is_blinking:
+            final_pose.eye_open = 0.0
+        else:
+            breath_cycle = np.sin(now * np.pi)
+            final_pose.head_tilt += breath_cycle * 0.02
+            final_pose.eye_open -= abs(breath_cycle) * 0.03
+
+        if self.vad.in_speech:
+            rms = self.vad.latest_rms
+            final_pose.mouth_open += rms * 4.0
+            final_pose.eye_open -= rms * 2.0
+
+        final_pose.eye_open = np.clip(final_pose.eye_open, 0, 1)
+        final_pose.mouth_open = np.clip(final_pose.mouth_open, 0, 1)
+
+        return final_pose, self.status, self.nlp.label
+
+    def shutdown(self):
+        print("Shutting down…")
+        self.vad.stop()
+        self.nlp.stop()
 
 
 if __name__ == "__main__":
-    main()
+    App().start()

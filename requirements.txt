@@ -1,0 +1,7 @@
+pygame
+sounddevice
+soundfile
+numpy
+webrtcvad
+openai
+python-dotenv
